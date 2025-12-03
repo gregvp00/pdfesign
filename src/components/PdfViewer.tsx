@@ -29,11 +29,17 @@ interface PdfViewerProps {
   scale: number;
   onLoadSuccess: (numPages: number) => void;
   signatures: SignatureData[];
-  onAddSignature: (page: number, xRatio: number, yRatio: number) => void;
+  // UPDATED: Now accepts pageWidth and pageHeight
+  onAddSignature: (
+    page: number,
+    xRatio: number,
+    yRatio: number,
+    pageWidth: number,
+    pageHeight: number
+  ) => void;
   onUpdateSignature: (id: string, updates: Partial<SignatureData>) => void;
   onRemoveSignature: (id: string) => void;
   isSigningMode: boolean;
-  // NEW PROP
   scrollContainer: HTMLElement | null;
 }
 
@@ -69,7 +75,14 @@ export function PdfViewer({
     const xRatio = clickX / pageDimensions.width;
     const yRatio = clickY / pageDimensions.height;
 
-    onAddSignature(pageNumber, xRatio, yRatio);
+    // UPDATED: Pass the actual rendered dimensions to the parent
+    onAddSignature(
+      pageNumber,
+      xRatio,
+      yRatio,
+      pageDimensions.width,
+      pageDimensions.height
+    );
   };
 
   const onPageLoad = (page: any) => {
@@ -158,7 +171,6 @@ export function PdfViewer({
                       scaledUpdates.rotation = updates.rotation;
                     onUpdateSignature(id, scaledUpdates);
                   }}
-                  // Pass reference down
                   scrollContainer={scrollContainer}
                 />
               ))}

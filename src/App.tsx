@@ -12,6 +12,7 @@ import {
 import { Dropzone, PDF_MIME_TYPE } from "@mantine/dropzone";
 import { notifications } from "@mantine/notifications";
 import {
+  IconUpload,
   IconFileDownload,
   IconPencil,
   IconX,
@@ -38,7 +39,6 @@ export default function App() {
   const [modalOpened, setModalOpened] = useState(false);
   const [currentSignature, setCurrentSignature] = useState<string | null>(null);
 
-  // NEW: Reference to the scrollable area
   const scrollViewportRef = useRef<HTMLDivElement>(null);
 
   const zoomIn = () => setScale((prev) => Math.min(prev + 0.2, 3.0));
@@ -87,31 +87,41 @@ export default function App() {
   const handleAddSignature = (
     pageNum: number,
     xRatio: number,
-    yRatio: number
+    yRatio: number,
+    pageWidth: number,
+    pageHeight: number
   ) => {
     if (!currentSignature) return;
 
-    const defaultWidthRatio = 0.2;
-    const defaultHeightRatio = 0.1;
+    const img = new Image();
+    img.src = currentSignature;
 
-    const newSig: SignatureData = {
-      id: uuidv4(),
-      page: pageNum,
-      xRatio: xRatio - defaultWidthRatio / 2,
-      yRatio: yRatio - defaultHeightRatio / 2,
-      widthRatio: defaultWidthRatio,
-      heightRatio: defaultHeightRatio,
-      rotation: 0,
-      dataUrl: currentSignature,
+    img.onload = () => {
+      const imgAspect = img.width / img.height;
+      const defaultWidthRatio = 0.2;
+      const signatureWidthPx = pageWidth * defaultWidthRatio;
+      const signatureHeightPx = signatureWidthPx / imgAspect;
+      const defaultHeightRatio = signatureHeightPx / pageHeight;
+
+      const newSig: SignatureData = {
+        id: uuidv4(),
+        page: pageNum,
+        xRatio: xRatio - defaultWidthRatio / 2,
+        yRatio: yRatio - defaultHeightRatio / 2,
+        widthRatio: defaultWidthRatio,
+        heightRatio: defaultHeightRatio,
+        rotation: 0,
+        dataUrl: currentSignature,
+      };
+
+      setSignatures((prev) => [...prev, newSig]);
+      setIsSigning(false);
+      notifications.show({
+        title: "Placed",
+        message: "Drag, resize, or rotate the signature.",
+        color: "blue",
+      });
     };
-
-    setSignatures((prev) => [...prev, newSig]);
-    setIsSigning(false);
-    notifications.show({
-      title: "Placed",
-      message: "Drag, resize, or rotate the signature.",
-      color: "blue",
-    });
   };
 
   const handleUpdateSignature = (
@@ -225,7 +235,7 @@ export default function App() {
                   onClick={replaceSignature}
                   leftSection={<IconRefresh size={16} />}
                 >
-                  Replace Sign
+                  Replace eSign
                 </Button>
               )}
 
@@ -234,7 +244,13 @@ export default function App() {
                 color={isSigning ? "red" : "blue"}
                 onClick={isSigning ? () => setIsSigning(false) : startSigning}
               >
-                {isSigning ? "Cancel" : "Sign"}
+                {
+                  isSigning
+                    ? "Cancel"
+                    : currentSignature
+                    ? "Place eSign"
+                    : "Sign" // <--- UPDATED LOGIC HERE
+                }
               </Button>
 
               <Button
@@ -282,14 +298,15 @@ export default function App() {
               alignItems: "center",
             }}
           >
-            {/* ... Dropzone Content ... */}
-            <Text size="xl" inline>
-              Drag PDF here
-            </Text>
+            <Group justify="center" gap="xl" style={{ pointerEvents: "none" }}>
+              <IconUpload size={50} stroke={1.5} />
+              <Text size="xl" inline>
+                Drag PDF here
+              </Text>
+            </Group>
           </Dropzone>
         ) : (
           <div
-            // 1. Attach the REF here
             ref={scrollViewportRef}
             style={{
               width: "100%",
@@ -309,7 +326,6 @@ export default function App() {
               onUpdateSignature={handleUpdateSignature}
               onRemoveSignature={handleRemoveSignature}
               isSigningMode={isSigning}
-              // 2. Pass the REF down
               scrollContainer={scrollViewportRef.current}
             />
           </div>
