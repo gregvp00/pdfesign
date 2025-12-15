@@ -1,6 +1,6 @@
 import { useState, useRef } from "react";
 import { v4 as uuidv4 } from "uuid";
-import { degrees, PDFDocument } from "pdf-lib";
+import { PDFDocument } from "pdf-lib";
 import {
   AppShell,
   Group,
@@ -8,6 +8,9 @@ import {
   Title,
   ActionIcon,
   Text,
+  Modal,
+  Progress,
+  Stack,
 } from "@mantine/core";
 import { Dropzone, PDF_MIME_TYPE } from "@mantine/dropzone";
 import { notifications } from "@mantine/notifications";
@@ -23,13 +26,21 @@ import {
   IconRefresh,
 } from "@tabler/icons-react";
 
-import { PdfViewer, type SignatureData } from "./components/PdfViewer";
+import {
+  PdfViewer,
+  type SignatureData,
+  type ExistingSignatureDisplay,
+} from "./components/PdfViewer";
 import { SignatureModal } from "./components/SignatureModal";
+import { signPdf, getExistingSignatures } from "./utils/pdf-signing";
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [pdfBytes, setPdfBytes] = useState<ArrayBuffer | null>(null);
   const [signatures, setSignatures] = useState<SignatureData[]>([]);
+  const [existingSignatures, setExistingSignatures] = useState<
+    ExistingSignatureDisplay[]
+  >([]);
 
   const [numPages, setNumPages] = useState<number>(0);
   const [pageNumber, setPageNumber] = useState<number>(1);
@@ -38,6 +49,13 @@ export default function App() {
   const [isSigning, setIsSigning] = useState(false);
   const [modalOpened, setModalOpened] = useState(false);
   const [currentSignature, setCurrentSignature] = useState<string | null>(null);
+
+  const [signingCredentials, setSigningCredentials] = useState<any>(null);
+  const [shouldLock, setShouldLock] = useState(false);
+
+  // Loading State
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
 
   const scrollViewportRef = useRef<HTMLDivElement>(null);
 
@@ -55,31 +73,68 @@ export default function App() {
     setPdfBytes(buffer);
     setPageNumber(1);
     setSignatures([]);
+    setSigningCredentials(null);
+    setShouldLock(false);
+
+    // Detect Existing Signatures
+    try {
+      const found = await getExistingSignatures(buffer);
+      setExistingSignatures(found);
+      if (found.length > 0) {
+        notifications.show({
+          title: "Signatures Detected",
+          message: `Found ${found.length} existing signatures.`,
+        });
+      }
+    } catch (e) {
+      console.warn("Error scanning signatures", e);
+    }
   };
 
   const startSigning = () => {
+    // If a signature is already placed, we don't allow adding another one
+    if (signatures.length > 0) {
+      notifications.show({
+        message: "One signature allowed. Use 'Replace' to change.",
+        color: "orange",
+      });
+      return;
+    }
+
     if (!currentSignature) {
       setModalOpened(true);
     } else {
       setIsSigning(true);
       notifications.show({
         title: "Signing Mode",
-        message: "Click anywhere on the PDF to place your signature.",
+        message: "Click on the PDF to place your signature.",
       });
     }
   };
 
   const replaceSignature = () => {
+    // Clear current placement to allow new one
+    setSignatures([]);
     setModalOpened(true);
     setIsSigning(false);
   };
 
-  const handleSignatureCreated = (dataUrl: string) => {
+  const handleSignatureCreated = (dataUrl: string, identityData?: any) => {
     setCurrentSignature(dataUrl);
+    if (identityData && identityData.credentials) {
+      setSigningCredentials(identityData.credentials);
+      setShouldLock(identityData.lockDocument || false);
+    } else {
+      // Clear credentials if switched to Draw mode
+      setSigningCredentials(null);
+      setShouldLock(false);
+    }
     setIsSigning(true);
     notifications.show({
-      title: "Signature Saved",
-      message: "Click on the PDF page to place it.",
+      title: "Signature Prepared",
+      message: identityData
+        ? "Certificate Loaded. Click to stamp."
+        : "Drawing Saved. Click to stamp.",
       color: "green",
     });
   };
@@ -92,6 +147,7 @@ export default function App() {
     pageHeight: number
   ) => {
     if (!currentSignature) return;
+    if (signatures.length > 0) return; // Prevent multiple
 
     const img = new Image();
     img.src = currentSignature;
@@ -114,11 +170,11 @@ export default function App() {
         dataUrl: currentSignature,
       };
 
-      setSignatures((prev) => [...prev, newSig]);
+      setSignatures([newSig]); // Only one signature allowed
       setIsSigning(false);
       notifications.show({
         title: "Placed",
-        message: "Drag, resize, or rotate the signature.",
+        message: "Signature placed. You can now Save.",
         color: "blue",
       });
     };
@@ -133,68 +189,120 @@ export default function App() {
     );
   };
 
-  const handleRemoveSignature = (id: string) => {
-    setSignatures((prev) => prev.filter((s) => s.id !== id));
+  const handleRemoveSignature = () => {
+    setSignatures([]);
   };
 
   const handleDownload = async () => {
     if (!pdfBytes) return;
+    if (signatures.length === 0) {
+      notifications.show({
+        title: "No Signatures",
+        message: "Please place signature before saving.",
+        color: "red",
+      });
+      return;
+    }
+
+    setIsExporting(true);
+    setExportProgress(10);
 
     try {
-      const pdfDoc = await PDFDocument.load(pdfBytes);
-      const pages = pdfDoc.getPages();
+      const signatureToSign = signatures[0];
+      const processingBuffer = pdfBytes; // Original buffer
 
-      const uniqueUrls = [...new Set(signatures.map((s) => s.dataUrl))];
-      const imgMap = new Map();
-      for (const url of uniqueUrls) {
-        const img = await pdfDoc.embedPng(url);
-        imgMap.set(url, img);
-      }
+      setExportProgress(40);
 
-      for (const sig of signatures) {
-        const page = pages[sig.page - 1];
+      if (signingCredentials) {
+        // DIGITAL SIGNATURE FLOW
+        const tempDoc = await PDFDocument.load(processingBuffer);
+        const page = tempDoc.getPages()[signatureToSign.page - 1];
+        const { width, height } = page.getSize();
+
+        const pdfX = signatureToSign.xRatio * width;
+        const pdfY =
+          height -
+          signatureToSign.yRatio * height -
+          signatureToSign.heightRatio * height;
+        const pdfW = signatureToSign.widthRatio * width;
+        const pdfH = signatureToSign.heightRatio * height;
+
+        const fetchRes = await fetch(signatureToSign.dataUrl);
+        const blob = await fetchRes.blob();
+        const imagePng = new Uint8Array(await blob.arrayBuffer());
+
+        setExportProgress(70);
+
+        const signedPdfBytes = await signPdf(
+          processingBuffer,
+          signingCredentials,
+          {
+            pageIndex: signatureToSign.page - 1,
+            rect: [pdfX, pdfY, pdfW, pdfH],
+            imagePng: imagePng,
+          },
+          shouldLock
+        );
+
+        downloadFile(signedPdfBytes, "signed");
+      } else {
+        // VISUAL ONLY FLOW
+        const pdfDoc = await PDFDocument.load(processingBuffer);
+        const pages = pdfDoc.getPages();
+        const page = pages[signatureToSign.page - 1];
         const { width: pageWidth, height: pageHeight } = page.getSize();
-        const img = imgMap.get(sig.dataUrl);
 
-        const pdfWidth = sig.widthRatio * pageWidth;
-        const pdfHeight = sig.heightRatio * pageHeight;
-        const pdfX = sig.xRatio * pageWidth;
-        const pdfY = pageHeight - sig.yRatio * pageHeight - pdfHeight;
+        const img = await pdfDoc.embedPng(signatureToSign.dataUrl);
 
-        page.drawImage(img, {
-          x: pdfX,
-          y: pdfY,
-          width: pdfWidth,
-          height: pdfHeight,
-          rotate: degrees(-sig.rotation),
-        });
+        const pdfX = signatureToSign.xRatio * pageWidth;
+        const pdfY =
+          pageHeight -
+          signatureToSign.yRatio * pageHeight -
+          signatureToSign.heightRatio * pageHeight;
+        const pdfW = signatureToSign.widthRatio * pageWidth;
+        const pdfH = signatureToSign.heightRatio * pageHeight;
+
+        page.drawImage(img, { x: pdfX, y: pdfY, width: pdfW, height: pdfH });
+
+        setExportProgress(80);
+        const finalBytes = await pdfDoc.save();
+        downloadFile(finalBytes, "visual-signed");
       }
 
-      const newPdfBytes = await pdfDoc.save();
-      const newBlob = new Blob([newPdfBytes as any], {
-        type: "application/pdf",
+      setExportProgress(100);
+      notifications.show({
+        title: "Success",
+        message: "Saved!",
+        color: "green",
       });
-
-      const link = document.createElement("a");
-      link.href = URL.createObjectURL(newBlob);
-      link.download = `signed-${file?.name || "document.pdf"}`;
-      link.click();
     } catch (e) {
       console.error(e);
       notifications.show({
         title: "Error",
-        message: "Failed to save PDF",
+        message: (e as Error).message,
         color: "red",
       });
+    } finally {
+      setTimeout(() => {
+        setIsExporting(false);
+        setExportProgress(0);
+      }, 1000);
     }
+  };
+
+  const downloadFile = (data: Uint8Array | ArrayBuffer, prefix: string) => {
+    const newBlob = new Blob([data as any], { type: "application/pdf" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(newBlob);
+    link.download = `${prefix}-${file?.name || "doc.pdf"}`;
+    link.click();
   };
 
   return (
     <AppShell header={{ height: 60 }} padding="md">
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between">
-          <Title order={3}>PDFesign</Title>
-
+          <Title order={3}>PDFesign Desktop</Title>
           {file && (
             <Group>
               <Group gap="xs" mr="xl">
@@ -216,7 +324,6 @@ export default function App() {
                   <IconArrowRight size={16} />
                 </ActionIcon>
               </Group>
-
               <Group gap="xs" mr="xl">
                 <ActionIcon variant="default" onClick={zoomOut}>
                   <IconZoomOut size={16} />
@@ -228,35 +335,32 @@ export default function App() {
                   <IconZoomIn size={16} />
                 </ActionIcon>
               </Group>
-
               {currentSignature && (
                 <Button
                   variant="default"
                   onClick={replaceSignature}
                   leftSection={<IconRefresh size={16} />}
                 >
-                  Replace eSign
+                  Replace
                 </Button>
               )}
-
               <Button
                 leftSection={<IconPencil size={18} />}
                 color={isSigning ? "red" : "blue"}
                 onClick={isSigning ? () => setIsSigning(false) : startSigning}
+                disabled={signatures.length > 0}
               >
-                {
-                  isSigning
-                    ? "Cancel"
-                    : currentSignature
-                    ? "Place eSign"
-                    : "Sign" // <--- UPDATED LOGIC HERE
-                }
+                {isSigning
+                  ? "Cancel"
+                  : signatures.length > 0
+                  ? "Signed"
+                  : "Sign"}
               </Button>
-
               <Button
                 leftSection={<IconFileDownload size={18} />}
                 variant="outline"
                 onClick={handleDownload}
+                loading={isExporting}
               >
                 Save
               </Button>
@@ -269,6 +373,9 @@ export default function App() {
                   setPdfBytes(null);
                   setSignatures([]);
                   setCurrentSignature(null);
+                  setSigningCredentials(null);
+                  setShouldLock(false);
+                  setExistingSignatures([]);
                 }}
               >
                 <IconX size={20} />
@@ -322,6 +429,7 @@ export default function App() {
               scale={scale}
               onLoadSuccess={setNumPages}
               signatures={signatures}
+              existingSignatures={existingSignatures}
               onAddSignature={handleAddSignature}
               onUpdateSignature={handleUpdateSignature}
               onRemoveSignature={handleRemoveSignature}
@@ -330,12 +438,23 @@ export default function App() {
             />
           </div>
         )}
-
         <SignatureModal
           opened={modalOpened}
           onClose={() => setModalOpened(false)}
           onConfirm={handleSignatureCreated}
         />
+        <Modal
+          opened={isExporting}
+          onClose={() => {}}
+          withCloseButton={false}
+          centered
+          title="Processing Document"
+        >
+          <Stack>
+            <Text size="sm">Encrypting and signing...</Text>
+            <Progress value={exportProgress} animated />
+          </Stack>
+        </Modal>
       </AppShell.Main>
     </AppShell>
   );

@@ -6,24 +6,34 @@ import {
   Stack,
   Text,
   Alert,
-  Loader,
+  FileInput,
+  PasswordInput,
+  Checkbox, // New import
 } from "@mantine/core";
 import SignatureCanvas from "react-signature-canvas";
 import {
   IconCertificate,
   IconAlertCircle,
   IconCheck,
+  IconLock,
 } from "@tabler/icons-react";
+import forge from "node-forge";
 
 interface SignatureModalProps {
   opened: boolean;
   onClose: () => void;
-  onConfirm: (signatureDataUrl: string) => void;
+  // Updated signature to accept lock preference
+  onConfirm: (
+    signatureDataUrl: string,
+    p12Details?: {
+      commonName: string;
+      issuer: string;
+      credentials?: any;
+      lockDocument?: boolean;
+    }
+  ) => void;
 }
 
-// ----------------------------------------
-// 1. HELPER: Trim whitespace from signature
-// ----------------------------------------
 function trimCanvas(canvas: HTMLCanvasElement) {
   const ctx = canvas.getContext("2d");
   if (!ctx) return canvas;
@@ -74,9 +84,6 @@ function trimCanvas(canvas: HTMLCanvasElement) {
   return trimmedCanvas;
 }
 
-// ----------------------------------------
-// 2. MAIN COMPONENT
-// ----------------------------------------
 export function SignatureModal({
   opened,
   onClose,
@@ -84,13 +91,20 @@ export function SignatureModal({
 }: SignatureModalProps) {
   const sigCanvas = useRef<SignatureCanvas>(null);
   const [mode, setMode] = useState<"draw" | "cert">("draw");
-  const [certStatus, setCertStatus] = useState<
-    "idle" | "waiting" | "success" | "error"
-  >("idle");
+
+  // P12 State
+  const [p12File, setP12File] = useState<File | null>(null);
+  const [password, setPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Lock state (Default Enabled)
+  const [lockDocument, setLockDocument] = useState(true);
+
   const [identity, setIdentity] = useState<{
     commonName: string;
-    serialNumber: string;
     issuer: string;
+    credentials?: any;
   } | null>(null);
 
   // Canvas Config
@@ -111,54 +125,75 @@ export function SignatureModal({
 
   useEffect(() => {
     if (opened && mode === "draw") setTimeout(applyScale, 10);
+    if (opened) {
+      setError(null);
+      setIdentity(null);
+      setP12File(null);
+      setPassword("");
+      setLockDocument(true); // Reset to true on open
+    }
   }, [opened, mode]);
 
-  // ----------------------------------------
-  // 3. HANDLE DIGITAL CERTIFICATE (POPUP)
-  // ----------------------------------------
-  const openCertPopup = () => {
-    setCertStatus("waiting");
+  const handleP12Parse = async () => {
+    if (!p12File) return;
+    setIsLoading(true);
+    setError(null);
 
-    // POINT TO YOUR CADDY SERVER
-    const SECURE_URL = "https://cccdev.gregvillar.com";
+    try {
+      const arrayBuffer = await p12File.arrayBuffer();
+      const p12Der = forge.util.createBuffer(arrayBuffer).getBytes();
+      const p12Asn1 = forge.asn1.fromDer(p12Der);
+      const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, password);
 
-    // Open the popup
-    const popup = window.open(
-      SECURE_URL,
-      "CertAuthWindow",
-      "width=600,height=600,left=200,top=200"
-    );
-
-    const handleMessage = (event: MessageEvent) => {
-      // SECURITY CHECK
-      if (event.origin !== SECURE_URL) return;
-
-      if (event.data?.type === "CERT_SUCCESS") {
-        setIdentity(event.data.payload);
-        setCertStatus("success");
-        popup?.close();
-        window.removeEventListener("message", handleMessage);
+      let certBag: any = null;
+      for (const safeContents of p12.safeContents) {
+        for (const safeBag of safeContents.safeBags) {
+          if (safeBag.type === forge.pki.oids.certBag) {
+            certBag = safeBag;
+            break;
+          }
+        }
       }
 
-      if (event.data?.type === "CERT_ERROR") {
-        setCertStatus("error");
-        popup?.close();
-        window.removeEventListener("message", handleMessage);
-      }
-    };
+      if (!certBag) throw new Error("No certificate found in P12 file.");
 
-    window.addEventListener("message", handleMessage);
+      const cert = certBag.cert;
+      const commonNameAttr = cert.subject.attributes.find(
+        (attr: any) => attr.shortName === "CN" || attr.name === "commonName"
+      );
+      const commonName = commonNameAttr ? commonNameAttr.value : "Unknown";
 
-    const timer = setInterval(() => {
-      if (popup && popup.closed) {
-        clearInterval(timer);
-        window.removeEventListener("message", handleMessage);
-        setCertStatus((prev) => (prev === "success" ? "success" : "idle"));
-      }
-    }, 1000);
+      const issuerAttr = cert.issuer.attributes.find(
+        (attr: any) => attr.shortName === "CN" || attr.name === "commonName"
+      );
+      const issuer = issuerAttr ? issuerAttr.value : "Unknown Issuer";
+
+      let privateKey;
+      const keyBags = p12.getBags({
+        bagType: forge.pki.oids.pkcs8ShroudedKeyBag,
+      });
+      const bag = keyBags[forge.pki.oids.pkcs8ShroudedKeyBag]?.[0];
+      if (bag) privateKey = bag.key;
+
+      if (!privateKey) throw new Error("No private key found.");
+
+      setIdentity({
+        commonName,
+        issuer,
+        credentials: {
+          privateKey,
+          certificate: cert,
+          certificates: [cert],
+        },
+      });
+      setIsLoading(false);
+    } catch (err: any) {
+      console.error(err);
+      setError("Failed to open P12. Check your password or file format.");
+      setIsLoading(false);
+    }
   };
 
-  // Define your background image path
   const BACKGROUND_IMAGE_URL = "/logoe.png";
 
   const handleCertConfirm = () => {
@@ -170,31 +205,23 @@ export function SignatureModal({
     const ctx = canvas.getContext("2d");
 
     if (ctx) {
-      // --------------------------------------------------------
-      // WRAPPER: Logic to draw borders & text
-      // --------------------------------------------------------
       const drawStampOverlay = () => {
-        // Reset Opacity for text
         ctx.globalAlpha = 1.0;
 
-        // 1. Draw Border
         ctx.lineWidth = 2;
         ctx.strokeStyle = "#000";
         ctx.strokeRect(5, 5, 640, 190);
 
-        // 2. Vertical Divider Line
         ctx.beginPath();
         ctx.moveTo(325, 20);
         ctx.lineTo(325, 180);
         ctx.lineWidth = 1;
         ctx.stroke();
 
-        // --- HELPER: Split text into lines ---
         const getWrappedLines = (text: string, maxWidth: number) => {
           const words = text.split(" ");
           const lines = [];
           let currentLine = words[0];
-
           for (let i = 1; i < words.length; i++) {
             const word = words[i];
             const width = ctx.measureText(currentLine + " " + word).width;
@@ -209,23 +236,19 @@ export function SignatureModal({
           return lines;
         };
 
-        // --- LEFT COLUMN: AUTO-CENTERED NAME ---
         ctx.fillStyle = "#000";
         ctx.font = "600 40px Arial";
 
         const leftLines = getWrappedLines(identity.commonName, 300);
         const lineHeightLeft = 44;
-
-        // Calculate vertical center for Left
         const totalLeftHeight = leftLines.length * lineHeightLeft;
-        let yLeft = (200 - totalLeftHeight) / 2 + 30; // Baseline correction
+        let yLeft = (200 - totalLeftHeight) / 2 + 30;
 
         for (const line of leftLines) {
           ctx.fillText(line, 20, yLeft);
           yLeft += lineHeightLeft;
         }
 
-        // --- RIGHT COLUMN: WRAPPED & CENTERED ---
         const xRight = 335;
         const maxWidthRight = 300;
         const lineHeightRight = 22;
@@ -234,14 +257,12 @@ export function SignatureModal({
         ctx.fillStyle = "#333";
         ctx.font = "18px Arial";
 
-        // Prepare Content & Measure Lines
         const nameLines = getWrappedLines(identity.commonName, maxWidthRight);
         const issuerLines = getWrappedLines(
           `Issuer: ${identity.issuer}`,
           maxWidthRight
         );
 
-        // Calculate Date String
         const now = new Date();
         const pad = (n: number) => String(n).padStart(2, "0");
         const datePart = `${now.getFullYear()}.${pad(now.getMonth() + 1)}.${pad(
@@ -256,18 +277,16 @@ export function SignatureModal({
         const offM = pad(Math.abs(offset) % 60);
         const dateString = `Date: ${datePart} ${timePart} ${sign}${offH}'${offM}'`;
 
-        // Calculate Total Height of Right Block
-        const totalRightHeight =
-          1 * lineHeightRight +
-          nameLines.length * lineHeightRight +
-          issuerLines.length * lineHeightRight +
-          1 * lineHeightRight +
-          blockSpacing * 3;
+        let yRight =
+          (200 -
+            (1 * lineHeightRight +
+              nameLines.length * lineHeightRight +
+              issuerLines.length * lineHeightRight +
+              1 * lineHeightRight +
+              blockSpacing * 3)) /
+            2 +
+          15;
 
-        // Calculate Start Y
-        let yRight = (200 - totalRightHeight) / 2 + 15;
-
-        // Draw Content
         ctx.font = "18px Arial";
         ctx.fillText("Digitally signed by", xRight, yRight);
         yRight += lineHeightRight + blockSpacing;
@@ -287,45 +306,33 @@ export function SignatureModal({
 
         ctx.fillText(dateString, xRight, yRight);
 
-        // FINALIZE
-        onConfirm(canvas.toDataURL("image/png"));
+        // Pass lock state back
+        onConfirm(canvas.toDataURL("image/png"), { ...identity, lockDocument });
         onClose();
       };
 
-      // --------------------------------------------------------
-      // IMAGE LOADING LOGIC
-      // --------------------------------------------------------
       const img = new Image();
       img.src = BACKGROUND_IMAGE_URL;
       img.crossOrigin = "Anonymous";
 
       img.onload = () => {
-        // Draw Image Background (ASPECT RATIO PRESERVED)
-        // 1. Calculate scaling to fit within canvas
         const scale = Math.min(
           canvas.width / img.width,
           canvas.height / img.height
         );
         const imgWidth = img.width * scale;
         const imgHeight = img.height * scale;
-
-        // 2. Calculate centering
         const x = (canvas.width - imgWidth) / 2;
         const y = (canvas.height - imgHeight) / 2;
 
         ctx.save();
-        ctx.globalAlpha = 0.3; // 30% Opacity (70% Transparent)
+        ctx.globalAlpha = 0.3;
         ctx.drawImage(img, x, y, imgWidth, imgHeight);
         ctx.restore();
-
-        // 3. Draw Text & Borders on top (Opacity reset inside helper)
         drawStampOverlay();
       };
 
       img.onerror = () => {
-        console.warn(
-          "Could not load background stamp image. Drawing text only."
-        );
         drawStampOverlay();
       };
     }
@@ -366,7 +373,7 @@ export function SignatureModal({
             onClick={() => setMode("cert")}
             leftSection={<IconCertificate size={20} />}
           >
-            Digital Certificate
+            Digital Certificate (P12)
           </Button>
         </Group>
 
@@ -409,63 +416,72 @@ export function SignatureModal({
               maxWidth: "100%",
             }}
           >
-            {certStatus === "idle" && (
-              <Stack align="center" justify="center" h={160}>
-                <Text size="sm" ta="center">
-                  To sign with your digital certificate, click below. A secure
-                  window will open.
+            {!identity ? (
+              <Stack>
+                <Text size="sm">
+                  Select your .p12 or .pfx certificate file to sign.
                 </Text>
-                <Button onClick={openCertPopup} color="green">
-                  Open Secure Gateway
-                </Button>
-              </Stack>
-            )}
-
-            {certStatus === "waiting" && (
-              <Stack align="center" justify="center" h={160}>
-                <Loader color="blue" />
-                <Text size="sm">Waiting for certificate validation...</Text>
-                <Text size="xs" c="dimmed">
-                  Select your certificate in the popup window
-                </Text>
-              </Stack>
-            )}
-
-            {certStatus === "error" && (
-              <Stack align="center" justify="center" h={160}>
-                <Alert
-                  title="Validation Error"
-                  color="red"
-                  icon={<IconAlertCircle />}
-                >
-                  Could not read the certificate or the operation was cancelled.
-                </Alert>
+                <FileInput
+                  label="Certificate File"
+                  placeholder="Select .p12 file"
+                  accept=".p12,.pfx"
+                  value={p12File}
+                  onChange={setP12File}
+                  leftSection={<IconCertificate size={16} />}
+                />
+                <PasswordInput
+                  label="Password"
+                  placeholder="Certificate password"
+                  value={password}
+                  onChange={(e) => setPassword(e.currentTarget.value)}
+                  leftSection={<IconLock size={16} />}
+                />
+                {error && (
+                  <Alert color="red" icon={<IconAlertCircle />}>
+                    {error}
+                  </Alert>
+                )}
                 <Button
-                  onClick={openCertPopup}
-                  variant="outline"
-                  color="red"
-                  size="xs"
+                  onClick={handleP12Parse}
+                  loading={isLoading}
+                  disabled={!p12File}
                 >
-                  Retry
+                  Load Certificate
                 </Button>
               </Stack>
-            )}
-
-            {certStatus === "success" && identity && (
+            ) : (
               <Stack>
                 <Alert
-                  title="Identity Verified"
+                  title="Certificate Loaded"
                   color="green"
                   icon={<IconCheck />}
                 >
-                  Valid certificate detected.
+                  Ready to sign.
                 </Alert>
                 <Text size="sm">
                   <strong>Signer:</strong> {identity.commonName}
                 </Text>
                 <Text size="sm">
-                  <strong>Serial Number:</strong> {identity.serialNumber}
+                  <strong>Issuer:</strong> {identity.issuer}
                 </Text>
+
+                {/* NEW CHECKBOX */}
+                <Checkbox
+                  label="Lock document after signing"
+                  description="Prevent further changes to the document"
+                  checked={lockDocument}
+                  onChange={(e) => setLockDocument(e.currentTarget.checked)}
+                  mt="sm"
+                />
+
+                <Button
+                  variant="outline"
+                  size="xs"
+                  color="gray"
+                  onClick={() => setIdentity(null)}
+                >
+                  Change Certificate
+                </Button>
               </Stack>
             )}
           </div>
@@ -479,9 +495,9 @@ export function SignatureModal({
           )}
           <Button
             onClick={mode === "draw" ? handleDrawConfirm : handleCertConfirm}
-            disabled={mode === "cert" && certStatus !== "success"}
+            disabled={mode === "cert" && !identity}
           >
-            {mode === "draw" ? "Use Drawing" : "Stamp Signature"}
+            {mode === "draw" ? "Use Drawing" : "Stamp & Embed Cert"}
           </Button>
         </Group>
       </Stack>

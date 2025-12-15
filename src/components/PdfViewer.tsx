@@ -1,8 +1,9 @@
 import { useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
-import { Box, LoadingOverlay, Text } from "@mantine/core";
+import { Box, LoadingOverlay, Text, Tooltip, Badge } from "@mantine/core";
 import { DraggableSignature } from "./DraggableSignature";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { IconLock } from "@tabler/icons-react";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -23,13 +24,20 @@ export interface SignatureData {
   dataUrl: string;
 }
 
+export interface ExistingSignatureDisplay {
+  fieldName: string;
+  signerName: string;
+  pageIndex: number;
+  rect: number[]; // [x, y, w, h]
+}
+
 interface PdfViewerProps {
   file: File | null;
   pageNumber: number;
   scale: number;
   onLoadSuccess: (numPages: number) => void;
   signatures: SignatureData[];
-  // UPDATED: Now accepts pageWidth and pageHeight
+  existingSignatures?: ExistingSignatureDisplay[]; // NEW PROP
   onAddSignature: (
     page: number,
     xRatio: number,
@@ -49,6 +57,7 @@ export function PdfViewer({
   scale,
   onLoadSuccess,
   signatures,
+  existingSignatures = [],
   onAddSignature,
   onUpdateSignature,
   onRemoveSignature,
@@ -75,7 +84,6 @@ export function PdfViewer({
     const xRatio = clickX / pageDimensions.width;
     const yRatio = clickY / pageDimensions.height;
 
-    // UPDATED: Pass the actual rendered dimensions to the parent
     onAddSignature(
       pageNumber,
       xRatio,
@@ -140,6 +148,51 @@ export function PdfViewer({
             renderAnnotationLayer={false}
             onLoadSuccess={onPageLoad}
           />
+
+          {/* Render Existing Signatures (Visual Detection) */}
+          {pageDimensions &&
+            existingSignatures
+              .filter((sig) => sig.pageIndex === pageNumber - 1)
+              .map((sig, idx) => (
+                <Tooltip
+                  key={idx}
+                  label={`Digitally Signed by ${sig.signerName}`}
+                  withArrow
+                >
+                  <div
+                    style={{
+                      position: "absolute",
+                      left: sig.rect[0] * scale,
+                      top:
+                        (pageDimensions.height - sig.rect[1] - sig.rect[3]) *
+                        scale, // PDF coordinates (bottom-up) to DOM (top-down)
+                      // Note: PDF rectangles are usually [llx, lly, width, height] where lly is from bottom.
+                      // We need to map this carefully.
+                      // However, getExistingSignatures returns [x, y, w, h] from pdf-lib which are PDF coords.
+                      // We might need to adjust y. Assuming standard PDF coords (0,0 bottom left).
+                      // Correct logic for Top position: PageHeight - (y + h)
+                      width: sig.rect[2] * scale,
+                      height: sig.rect[3] * scale,
+                      border: "2px solid #fab005",
+                      backgroundColor: "rgba(250, 176, 5, 0.1)",
+                      zIndex: 4,
+                      pointerEvents: "auto",
+                      cursor: "help",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    <Badge
+                      size="xs"
+                      color="yellow"
+                      leftSection={<IconLock size={10} />}
+                    >
+                      {sig.signerName}
+                    </Badge>
+                  </div>
+                </Tooltip>
+              ))}
 
           {pageDimensions &&
             signatures
